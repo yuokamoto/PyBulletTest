@@ -11,11 +11,12 @@ import random
 import time
 import argparse
 import sys
+import os
 
 class ConfigurableRobotSimulation:
     """Configurable multi-robot simulation with adjustable parameters"""
     
-    def __init__(self, num_robots=10, target_realtime_factor=1.0, time_step=1./240., use_gui=True, enable_physics=True, verbose=False):
+    def __init__(self, num_robots=10, target_realtime_factor=1.0, time_step=1./240., use_gui=True, enable_physics=False, verbose=False):
         self.num_robots = num_robots
         self.target_realtime_factor = target_realtime_factor
         self.time_step = time_step
@@ -24,6 +25,9 @@ class ConfigurableRobotSimulation:
         self.verbose = verbose
         self.robots = []
         self.robot_bodies = []
+        self.robot_types = []  # Track which type each robot is
+        self.robot_joints = []  # Track joint info for each robot
+        self.robot_constraints = []  # Track constraints for mobile robots
         self.collision_count = 0
         self.step_count = 0
         self.start_time = None
@@ -62,23 +66,39 @@ class ConfigurableRobotSimulation:
             print(f"Physics: {'Enabled' if self.enable_physics else 'Disabled (performance mode)'}")
         
     def create_robot(self, position, robot_id):
-        """Create a robot with unique visual appearance"""
-        # Generate unique color based on robot ID
-        hue = (robot_id * 137.5) % 360  # Golden angle for good distribution
-        color = self._hsv_to_rgb(hue/360, 0.8, 0.9) + [1.0]
+        """Create a robot (either arm_robot or mobile_robot) with random selection"""
+        # Randomly choose robot type
+        robot_types = ['arm_robot', 'mobile_robot']
+        robot_type = random.choice(robot_types)
         
-        collision_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.4, 0.25, 0.15])
-        visual_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.4, 0.25, 0.15], rgbaColor=color)
+        # Load appropriate URDF
+        urdf_path = os.path.join('robots', f'{robot_type}.urdf')
         
-        # Set mass based on physics mode
-        mass = 1.0 if self.enable_physics else 0.0  # Mass = 0 disables physics forces
+        # Set orientation and position based on robot type
+        if robot_type == 'arm_robot':
+            orientation = p.getQuaternionFromEuler([0, 0, 0])  # Upright
+            # Place arm robots on the ground (z=0)
+            arm_position = [position[0], position[1], 0]
+        else:  # mobile_robot
+            orientation = p.getQuaternionFromEuler([0, 0, 0])  # Normal orientation
+            arm_position = position
         
-        robot_body = p.createMultiBody(baseMass=mass,
-                                     baseCollisionShapeIndex=collision_shape,
-                                     baseVisualShapeIndex=visual_shape,
-                                     basePosition=position)
+        # Load robot from URDF with optimized settings
+        if self.enable_physics:
+            robot_body = p.loadURDF(urdf_path, arm_position, orientation, useFixedBase=(robot_type == 'arm_robot'))
+        else:
+            # In no-physics mode, load faster without collision checking
+            robot_body = p.loadURDF(urdf_path, arm_position, orientation, 
+                                   useFixedBase=(robot_type == 'arm_robot'),
+                                   flags=p.URDF_USE_INERTIA_FROM_FILE)
         
-        return robot_body
+        # Get joint information for this robot (cached for performance)
+        joint_info = []
+        num_joints = p.getNumJoints(robot_body)
+        for i in range(num_joints):
+            joint_info.append(p.getJointInfo(robot_body, i))
+        
+        return robot_body, robot_type, joint_info
     
     def _hsv_to_rgb(self, h, s, v):
         """Convert HSV to RGB color space"""
@@ -89,10 +109,19 @@ class ConfigurableRobotSimulation:
         """Spawn robots in a grid pattern to avoid initial overlaps"""
         if self.verbose:
             print(f"Spawning {self.num_robots} robots...")
+            spawn_start = time.time()
         
         # Calculate grid dimensions
         grid_size = int(np.ceil(np.sqrt(self.num_robots)))
         spacing = 2.0  # Distance between robots
+        
+        # Pre-generate robot types for better performance
+        robot_types_list = ['arm_robot', 'mobile_robot']
+        selected_types = [random.choice(robot_types_list) for _ in range(self.num_robots)]
+        
+        # Disable rendering during spawn for speed
+        if self.use_gui:
+            p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
         
         for i in range(self.num_robots):
             # Grid position
@@ -102,27 +131,104 @@ class ConfigurableRobotSimulation:
             # Calculate world position
             x = (col - grid_size/2) * spacing
             y = (row - grid_size/2) * spacing
-            z = 1.0  # Above ground
+            # Set different heights for different robot types
+            if selected_types[i] == 'mobile_robot':
+                z = 0.3  # Mobile robots slightly above ground
+            else:  # arm_robot
+                z = 0.0  # Arm robots on ground
             position = [x, y, z]
             
-            # Create robot
-            robot_body = self.create_robot(position, i)
+            # Create robot with pre-selected type
+            robot_body, robot_type, joint_info = self.create_robot_fast(position, i, selected_types[i])
             self.robot_bodies.append(robot_body)
+            self.robot_types.append(robot_type)
+            self.robot_joints.append(joint_info)
+            
+            # For mobile robots, we'll handle yaw-only rotation in apply_random_movements
+            # instead of using constraints which can be problematic
+            self.robot_constraints.append(None)
+            
+        # Re-enable rendering
+        if self.use_gui:
+            p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
             
         if self.verbose:
+            spawn_time = time.time() - spawn_start
             print(f"Successfully spawned {len(self.robot_bodies)} robots in {grid_size}x{grid_size} grid")
+            print(f"Spawn time: {spawn_time:.3f}s ({len(self.robot_bodies)/spawn_time:.1f} robots/sec)")
+    
+    def create_robot_fast(self, position, robot_id, robot_type):
+        """Optimized robot creation with pre-selected type"""
+        # Load appropriate URDF
+        urdf_path = os.path.join('robots', f'{robot_type}.urdf')
+        
+        # Set orientation and position based on robot type
+        orientation = p.getQuaternionFromEuler([0, 0, 0])
+        if robot_type == 'mobile_robot':
+            final_position = [position[0], position[1], 0.3]  # Mobile robots at height 0.3
+        else:  # arm_robot
+            final_position = [position[0], position[1], 0]  # Arm robots on ground
+        
+        # Load robot with optimized flags
+        flags = p.URDF_USE_INERTIA_FROM_FILE
+        if not self.enable_physics:
+            flags |= p.URDF_IGNORE_COLLISION_SHAPES
+            
+        robot_body = p.loadURDF(urdf_path, final_position, orientation, 
+                               useFixedBase=(robot_type == 'arm_robot'),
+                               flags=flags)
+        
+        # Note: Mobile robot constraints will be handled in spawn_robots method
+        
+        # Get joint information
+        joint_info = []
+        num_joints = p.getNumJoints(robot_body)
+        for i in range(num_joints):
+            joint_info.append(p.getJointInfo(robot_body, i))
+        
+        return robot_body, robot_type, joint_info
         
     def apply_random_movements(self):
         """Apply random movement commands to all robots"""
-        for robot_body in self.robot_bodies:
-            # Generate random linear velocity
-            max_speed = 3.0
-            linear_vel = [random.uniform(-max_speed, max_speed), 
-                         random.uniform(-max_speed, max_speed), 0]
-            angular_vel = [0, 0, random.uniform(-1.5, 1.5)]
-            
-            # Apply velocity to robot body
-            p.resetBaseVelocity(robot_body, linear_vel, angular_vel)
+        for i, (robot_body, robot_type) in enumerate(zip(self.robot_bodies, self.robot_types)):
+            if robot_type == 'mobile_robot':
+                # Generate random forward/backward and yaw velocities
+                max_linear_speed = 2.0  # m/s
+                max_angular_speed = 1.5  # rad/s
+                
+                forward_vel = random.uniform(-max_linear_speed, max_linear_speed)  # Forward/backward
+                yaw_vel = random.uniform(-max_angular_speed, max_angular_speed)  # Yaw rotation
+                
+                # Apply velocity control - only forward/backward and yaw
+                linear_vel = [forward_vel, 0, 0]  # Only X-direction movement
+                angular_vel = [0, 0, yaw_vel]  # Only Z-axis (yaw) rotation
+                
+                # Enforce position and orientation constraints
+                pos, orn = p.getBasePositionAndOrientation(robot_body)
+                euler = p.getEulerFromQuaternion(orn)
+                # Keep only yaw (Z rotation), reset pitch and roll to 0
+                corrected_orn = p.getQuaternionFromEuler([0, 0, euler[2]])
+                # Ensure robot stays at correct height (z=0.3)
+                p.resetBasePositionAndOrientation(robot_body, [pos[0], pos[1], 0.3], corrected_orn)
+                
+                # Apply the velocity commands directly to the robot body
+                p.resetBaseVelocity(robot_body, linear_vel, angular_vel)
+                        
+            elif robot_type == 'arm_robot':
+                # Apply joint commands for arm robots (fixed to floor)
+                joint_info = self.robot_joints[i]
+                for j, info in enumerate(joint_info):
+                    joint_type = info[2]
+                    if joint_type == p.JOINT_REVOLUTE:  # Only control revolute joints
+                        # Random joint position target
+                        joint_limits = info[8:10]  # lower, upper limits
+                        if joint_limits[0] < joint_limits[1]:  # Valid limits
+                            target_pos = random.uniform(joint_limits[0], joint_limits[1])
+                            p.setJointMotorControl2(robot_body, j, p.POSITION_CONTROL, targetPosition=target_pos)
+                        else:
+                            # No limits or invalid limits, use small random movement
+                            target_pos = random.uniform(-1.0, 1.0)
+                            p.setJointMotorControl2(robot_body, j, p.POSITION_CONTROL, targetPosition=target_pos)
             
     def check_collisions(self):
         """Check for collisions and count them"""
@@ -164,7 +270,7 @@ class ConfigurableRobotSimulation:
             f"Actual Speed: {actual_realtime_factor:.1f}x",
             f"Time Step: {self.time_step:.4f}s ({1/self.time_step:.0f}Hz)",
             f"Physics: {'ON' if self.enable_physics else 'OFF'}",
-            f"Robots: {self.num_robots}",
+            f"Robots: {self.num_robots} (Arms: {self.robot_types.count('arm_robot')}, Mobile: {self.robot_types.count('mobile_robot')})",
             f"Collisions: {self.collision_count}",
             f"Step: {self.step_count}"
         ]
@@ -200,7 +306,7 @@ class ConfigurableRobotSimulation:
             steps_per_sec = self.step_count / elapsed_time
             
             print(f"\n=== Simulation Statistics ===")
-            print(f"Robots: {self.num_robots}")
+            print(f"Robots: {self.num_robots} (Arms: {self.robot_types.count('arm_robot')}, Mobile: {self.robot_types.count('mobile_robot')})")
             print(f"Physics: {'Enabled' if self.enable_physics else 'Disabled (performance mode)'}")
             print(f"Time step: {self.time_step:.6f}s ({1/self.time_step:.1f} Hz)")
             print(f"Target realtime factor: {self.target_realtime_factor}x")
@@ -302,6 +408,13 @@ class ConfigurableRobotSimulation:
     def disconnect(self):
         """Clean up and disconnect from PyBullet"""
         self.clear_display_text()
+        # Clean up constraints
+        for constraint_id in getattr(self, 'robot_constraints', []):
+            if constraint_id is not None:
+                try:
+                    p.removeConstraint(constraint_id)
+                except:
+                    pass
         p.disconnect()
 
 def main():
@@ -332,8 +445,10 @@ Examples:
                       help='Enable GUI (default: enabled)')
     parser.add_argument('--no-gui', action='store_true',
                       help='Disable GUI for better performance')
+    parser.add_argument('--physics', action='store_true',
+                      help='Enable physics simulation (disabled by default for performance)')
     parser.add_argument('--no-physics', action='store_true',
-                      help='Disable physics simulation for maximum performance')
+                      help='Explicitly disable physics simulation (default behavior)')
     parser.add_argument('--verbose', '-v', action='store_true',
                       help='Enable verbose output')
     
@@ -358,7 +473,8 @@ Examples:
     
     # Handle GUI and physics flags
     use_gui = args.gui and not args.no_gui
-    enable_physics = not args.no_physics
+    # Physics is disabled by default, enabled only if --physics flag is used
+    enable_physics = args.physics and not args.no_physics
     
     # Display configuration
     print("=== Multi-Robot Simulation Demo ===")
@@ -372,13 +488,17 @@ Examples:
     print(f"  Verbose: {'Enabled' if args.verbose else 'Disabled'}")
     print()
     
-    # Performance warnings
+    # Robot behavior info and performance warnings
     if args.robots > 100:
         print("⚠️  Warning: Large number of robots may impact performance")
     if args.speed > 10 and use_gui:
         print("⚠️  Warning: High speed with GUI may cause visual lag")
     if args.robots > 50 and args.speed > 5:
         print("⚠️  Warning: High robot count + speed may stress system")
+    
+    print("Robot behaviors:")
+    print("  - Arm robots: Fixed to ground (z=0), joint position control")
+    print("  - Mobile robots: Height z=0.3, direct velocity control (forward/back + yaw only)")
     
     print("Starting simulation... (Press Ctrl+C to stop early)")
     print()
