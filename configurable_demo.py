@@ -101,40 +101,6 @@ class ConfigurableRobotSimulation:
         # Pre-cache robot assets for faster spawning
         self.cache_robot_assets()
         
-    def create_robot(self, position, robot_id):
-        """Create a robot (either arm_robot or mobile_robot) with random selection"""
-        # Randomly choose robot type
-        robot_types = ['arm_robot', 'mobile_robot']
-        robot_type = random.choice(robot_types)
-        
-        # Load appropriate URDF
-        urdf_path = os.path.join('robots', f'{robot_type}.urdf')
-        
-        # Set orientation and position based on robot type
-        if robot_type == 'arm_robot':
-            orientation = p.getQuaternionFromEuler([0, 0, 0])  # Upright
-            # Place arm robots on the ground (z=0)
-            arm_position = [position[0], position[1], 0]
-        else:  # mobile_robot
-            orientation = p.getQuaternionFromEuler([0, 0, 0])  # Normal orientation
-            arm_position = position
-        
-        # Load robot from URDF with optimized settings
-        if self.enable_physics:
-            robot_body = p.loadURDF(urdf_path, arm_position, orientation, useFixedBase=(robot_type == 'arm_robot'))
-        else:
-            # In no-physics mode, load faster without collision checking
-            robot_body = p.loadURDF(urdf_path, arm_position, orientation, 
-                                   useFixedBase=(robot_type == 'arm_robot'),
-                                   flags=p.URDF_USE_INERTIA_FROM_FILE)
-        
-        # Get joint information for this robot (cached for performance)
-        joint_info = []
-        num_joints = p.getNumJoints(robot_body)
-        for i in range(num_joints):
-            joint_info.append(p.getJointInfo(robot_body, i))
-        
-        return robot_body, robot_type, joint_info
     
     def _hsv_to_rgb(self, h, s, v):
         """Convert HSV to RGB color space"""
@@ -324,30 +290,8 @@ class ConfigurableRobotSimulation:
                 print(f"Template creation failed for {robot_type}: {e}")
             return None
     
-    def create_robot_from_memory(self, robot_type, position):
-        """Alternative: Create robot from cached URDF content (experimental)"""
-        if robot_type not in self.cached_urdf_contents or not self.cached_urdf_contents[robot_type]:
-            return None
-        
-        try:
-            # This would require PyBullet to support loading from string
-            # Currently PyBullet doesn't support this directly, but we keep the structure
-            # for potential future improvements
-            pass
-        except Exception:
-            return None
     
-    def get_cached_robot_info(self, robot_type):
-        """Get all cached information for a robot type"""
-        if robot_type in self.template_robots:
-            return self.template_robots[robot_type]
-        return None
     
-    def create_robot_fast(self, position, robot_id, robot_type):
-        """Legacy method - now replaced by optimized spawn_robots"""
-        # This method is kept for compatibility but is no longer used
-        # The optimized spawning is now handled directly in spawn_robots()
-        pass
         
     def apply_random_movements(self):
         """Apply random movement commands to all robots"""
