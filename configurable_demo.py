@@ -304,15 +304,21 @@ class ConfigurableRobotSimulation:
                 forward_vel = random.uniform(-max_linear_speed, max_linear_speed)  # Forward/backward
                 yaw_vel = random.uniform(-max_angular_speed, max_angular_speed)  # Yaw rotation
                 
-                # Apply velocity control - only forward/backward and yaw
-                linear_vel = [forward_vel, 0, 0]  # Only X-direction movement
-                angular_vel = [0, 0, yaw_vel]  # Only Z-axis (yaw) rotation
-                
-                # Enforce position and orientation constraints
+                # Get current robot position and orientation
                 pos, orn = p.getBasePositionAndOrientation(robot_body)
                 euler = p.getEulerFromQuaternion(orn)
+                
+                # Calculate forward direction in world coordinates based on robot's yaw
+                yaw = euler[2]  # Current yaw angle
+                forward_x = forward_vel * np.cos(yaw)  # World X component
+                forward_y = forward_vel * np.sin(yaw)  # World Y component
+                
+                # Apply velocity in robot's forward direction (robot coordinate X-axis)
+                linear_vel = [forward_x, forward_y, 0]  # Forward/backward in robot's direction
+                angular_vel = [0, 0, yaw_vel]  # Only Z-axis (yaw) rotation
+                
                 # Keep only yaw (Z rotation), reset pitch and roll to 0
-                corrected_orn = p.getQuaternionFromEuler([0, 0, euler[2]])
+                corrected_orn = p.getQuaternionFromEuler([0, 0, yaw])
                 # Ensure robot stays at correct height (z=0.3)
                 p.resetBasePositionAndOrientation(robot_body, [pos[0], pos[1], 0.3], corrected_orn)
                 
