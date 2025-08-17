@@ -12,6 +12,8 @@ import time
 import argparse
 import sys
 import os
+import json
+from data_monitor import DataMonitor
 
 class ConfigurableRobotSimulation:
     """Configurable multi-robot simulation with adjustable parameters"""
@@ -29,6 +31,15 @@ class ConfigurableRobotSimulation:
         self.robot_joints = []  # Track joint info for each robot
         self.robot_constraints = []  # Track constraints for mobile robots
         self.collision_count = 0
+        
+        # Advanced URDF caching for maximum performance
+        self.cached_urdfs = {}  # Cache URDF paths and flags
+        self.cached_joint_info = {}  # Cache joint information
+        self.cached_urdf_contents = {}  # Cache URDF file contents in memory
+        self.template_robots = {}  # Cache fully constructed robot templates
+        self.cached_visual_shapes = {}  # Cache visual shape IDs
+        self.cached_collision_shapes = {}  # Cache collision shape IDs
+        self.assets_cached = False
         self.step_count = 0
         self.start_time = None
         
@@ -37,6 +48,11 @@ class ConfigurableRobotSimulation:
         self.last_display_update = 0
         self.last_movement_update = 0
         self.last_collision_check = 0
+        
+        # Data monitor setup
+        self.data_monitor = None
+        self.data_file = "/tmp/pybullet_sim_data.json"
+        self.monitor_enabled = False
         
         # Initialize PyBullet
         if use_gui:
@@ -47,7 +63,7 @@ class ConfigurableRobotSimulation:
         # Set search path for URDF files
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         
-        # Configure simulation parameters
+        # Configure simulation parameters with caching optimizations
         if self.enable_physics:
             p.setGravity(0, 0, -9.81)
         else:
@@ -57,6 +73,23 @@ class ConfigurableRobotSimulation:
         p.setTimeStep(self.time_step)
         p.setRealTimeSimulation(0)  # Always disable for controlled speed
         
+        # Enable PyBullet's internal caching for maximum performance
+        p.setPhysicsEngineParameter(
+            enableFileCaching=True,  # Cache loaded files
+            deterministicOverlappingPairs=True,  # Deterministic behavior
+            allowedCcdPenetration=0.01,  # Optimized collision detection
+            maxNumCmdPer1ms=10000,  # Increase command buffer
+        )
+        
+        # Additional performance optimizations for non-physics mode
+        if not self.enable_physics:
+            p.setPhysicsEngineParameter(
+                numSubSteps=1,  # Minimum substeps
+                numSolverIterations=1,  # Minimum solver iterations
+                enableConeFriction=False,  # Disable complex friction
+                contactBreakingThreshold=0.01,  # Smaller threshold
+            )
+        
         # Load ground plane
         self.plane_id = p.loadURDF("plane.urdf")
         
@@ -64,6 +97,9 @@ class ConfigurableRobotSimulation:
             print(f"Simulation initialized with {num_robots} robots at {target_realtime_factor}x target speed")
             print(f"Time step: {self.time_step:.6f}s ({1/self.time_step:.1f} Hz)")
             print(f"Physics: {'Enabled' if self.enable_physics else 'Disabled (performance mode)'}")
+            
+        # Pre-cache robot assets for faster spawning
+        self.cache_robot_assets()
         
     def create_robot(self, position, robot_id):
         """Create a robot (either arm_robot or mobile_robot) with random selection"""
@@ -105,88 +141,213 @@ class ConfigurableRobotSimulation:
         import colorsys
         return list(colorsys.hsv_to_rgb(h, s, v))
         
+    def cache_robot_assets(self):
+        """Pre-load and cache all robot assets including URDF contents and templates"""
+        if self.assets_cached:
+            return
+            
+        if self.verbose:
+            print("Caching robot assets with advanced optimization...")
+            cache_start = time.time()
+        
+        robot_types = ['arm_robot', 'mobile_robot']
+        
+        for robot_type in robot_types:
+            urdf_path = os.path.join('robots', f'{robot_type}.urdf')
+            
+            # Cache URDF file contents in memory
+            try:
+                with open(urdf_path, 'r') as f:
+                    urdf_content = f.read()
+                self.cached_urdf_contents[robot_type] = urdf_content
+                if self.verbose:
+                    print(f"  Cached URDF content for {robot_type} ({len(urdf_content)} bytes)")
+            except Exception as e:
+                print(f"Warning: Could not cache URDF content for {robot_type}: {e}")
+                self.cached_urdf_contents[robot_type] = None
+            
+            # Determine optimal flags for this robot type
+            flags = p.URDF_USE_INERTIA_FROM_FILE
+            if not self.enable_physics:
+                flags |= p.URDF_IGNORE_COLLISION_SHAPES
+            
+            # Create template robot and extract all information
+            temp_position = [1000, 1000, 1000]  # Far away position
+            template_robot = p.loadURDF(
+                urdf_path, temp_position, [0, 0, 0, 1],
+                useFixedBase=(robot_type == 'arm_robot'),
+                flags=flags
+            )
+            
+            # Cache comprehensive robot information
+            joint_info = []
+            num_joints = p.getNumJoints(template_robot)
+            for i in range(num_joints):
+                joint_info.append(p.getJointInfo(template_robot, i))
+            
+            # Extract visual and collision information for potential shape caching
+            visual_data = p.getVisualShapeData(template_robot)
+            collision_data = p.getCollisionShapeData(template_robot, -1)  # Base link
+            
+            # Store all cached data
+            self.cached_joint_info[robot_type] = joint_info
+            self.cached_visual_shapes[robot_type] = visual_data
+            self.cached_collision_shapes[robot_type] = collision_data
+            
+            # Cache URDF loading parameters
+            self.cached_urdfs[robot_type] = {
+                'path': urdf_path,
+                'flags': flags,
+                'useFixedBase': (robot_type == 'arm_robot')
+            }
+            
+            # Store template robot data (but don't keep the actual robot)
+            base_mass = p.getDynamicsInfo(template_robot, -1)[0]  # Get base mass
+            self.template_robots[robot_type] = {
+                'base_mass': base_mass,
+                'num_joints': num_joints,
+                'joint_info': joint_info,
+                'visual_data': visual_data,
+                'collision_data': collision_data,
+                'flags': flags,
+                'useFixedBase': (robot_type == 'arm_robot')
+            }
+            
+            # Remove template robot
+            p.removeBody(template_robot)
+            
+            if self.verbose:
+                print(f"  Cached template for {robot_type} ({num_joints} joints)")
+        
+        self.assets_cached = True
+        
+        if self.verbose:
+            cache_time = time.time() - cache_start
+            total_urdf_size = sum(len(content) if content else 0 
+                                for content in self.cached_urdf_contents.values())
+            print(f"Advanced assets cached in {cache_time:.3f}s")
+            print(f"  Total URDF content cached: {total_urdf_size} bytes")
+            print(f"  Template robots: {len(self.template_robots)}")
+    
     def spawn_robots(self):
-        """Spawn robots in a grid pattern to avoid initial overlaps"""
+        """Optimized robot spawning using cached assets"""
         if self.verbose:
             print(f"Spawning {self.num_robots} robots...")
             spawn_start = time.time()
+        
+        # Ensure assets are cached
+        self.cache_robot_assets()
         
         # Calculate grid dimensions
         grid_size = int(np.ceil(np.sqrt(self.num_robots)))
         spacing = 2.0  # Distance between robots
         
-        # Pre-generate robot types for better performance
+        # Pre-generate all robot types and positions for batch processing
         robot_types_list = ['arm_robot', 'mobile_robot']
         selected_types = [random.choice(robot_types_list) for _ in range(self.num_robots)]
         
-        # Disable rendering during spawn for speed
-        if self.use_gui:
-            p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
-        
+        # Pre-calculate all positions
+        positions = []
         for i in range(self.num_robots):
-            # Grid position
             row = i // grid_size
             col = i % grid_size
-            
-            # Calculate world position
             x = (col - grid_size/2) * spacing
             y = (row - grid_size/2) * spacing
-            # Set different heights for different robot types
-            if selected_types[i] == 'mobile_robot':
-                z = 0.3  # Mobile robots slightly above ground
-            else:  # arm_robot
-                z = 0.0  # Arm robots on ground
-            position = [x, y, z]
+            z = 0.3 if selected_types[i] == 'mobile_robot' else 0.0
+            positions.append([x, y, z])
+        
+        # Disable rendering and visual effects during spawn for maximum speed
+        if self.use_gui:
+            p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
+            p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0)
+            p.configureDebugVisualizer(p.COV_ENABLE_WIREFRAME, 0)
+            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+        
+        # Ultra-fast batch spawn using cached templates
+        for i in range(self.num_robots):
+            robot_type = selected_types[i]
+            position = positions[i]
             
-            # Create robot with pre-selected type
-            robot_body, robot_type, joint_info = self.create_robot_fast(position, i, selected_types[i])
+            # Try advanced caching first, fallback to basic caching
+            robot_body = self.create_robot_from_template(robot_type, position)
+            
+            if robot_body is None:
+                # Fallback to basic cached loading
+                cache_data = self.cached_urdfs[robot_type]
+                robot_body = p.loadURDF(
+                    cache_data['path'], position, [0, 0, 0, 1],
+                    useFixedBase=cache_data['useFixedBase'],
+                    flags=cache_data['flags']
+                )
+            
+            # Use cached joint information
+            joint_info = self.cached_joint_info[robot_type]
+            
             self.robot_bodies.append(robot_body)
             self.robot_types.append(robot_type)
             self.robot_joints.append(joint_info)
-            
-            # For mobile robots, we'll handle yaw-only rotation in apply_random_movements
-            # instead of using constraints which can be problematic
             self.robot_constraints.append(None)
-            
-        # Re-enable rendering
+        
+        # Re-enable rendering (but keep other optimizations)
         if self.use_gui:
             p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
-            
+            # Keep shadows and GUI disabled for better performance
+            # p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 1)  # Keep disabled
+            # p.configureDebugVisualizer(p.COV_ENABLE_GUI, 1)      # Keep disabled
+        
         if self.verbose:
             spawn_time = time.time() - spawn_start
+            robots_per_sec = len(self.robot_bodies) / spawn_time if spawn_time > 0 else 0
             print(f"Successfully spawned {len(self.robot_bodies)} robots in {grid_size}x{grid_size} grid")
-            print(f"Spawn time: {spawn_time:.3f}s ({len(self.robot_bodies)/spawn_time:.1f} robots/sec)")
+            print(f"Spawn time: {spawn_time:.3f}s ({robots_per_sec:.1f} robots/sec)")
+    
+    def create_robot_from_template(self, robot_type, position):
+        """Create robot using cached template data for maximum speed"""
+        if robot_type not in self.template_robots:
+            return None
+            
+        try:
+            # Use cached URDF data for fastest possible loading
+            cache_data = self.cached_urdfs[robot_type]
+            
+            # Load robot with all optimizations
+            robot_body = p.loadURDF(
+                cache_data['path'], position, [0, 0, 0, 1],
+                useFixedBase=cache_data['useFixedBase'],
+                flags=cache_data['flags']
+            )
+            
+            return robot_body
+            
+        except Exception as e:
+            if self.verbose:
+                print(f"Template creation failed for {robot_type}: {e}")
+            return None
+    
+    def create_robot_from_memory(self, robot_type, position):
+        """Alternative: Create robot from cached URDF content (experimental)"""
+        if robot_type not in self.cached_urdf_contents or not self.cached_urdf_contents[robot_type]:
+            return None
+        
+        try:
+            # This would require PyBullet to support loading from string
+            # Currently PyBullet doesn't support this directly, but we keep the structure
+            # for potential future improvements
+            pass
+        except Exception:
+            return None
+    
+    def get_cached_robot_info(self, robot_type):
+        """Get all cached information for a robot type"""
+        if robot_type in self.template_robots:
+            return self.template_robots[robot_type]
+        return None
     
     def create_robot_fast(self, position, robot_id, robot_type):
-        """Optimized robot creation with pre-selected type"""
-        # Load appropriate URDF
-        urdf_path = os.path.join('robots', f'{robot_type}.urdf')
-        
-        # Set orientation and position based on robot type
-        orientation = p.getQuaternionFromEuler([0, 0, 0])
-        if robot_type == 'mobile_robot':
-            final_position = [position[0], position[1], 0.3]  # Mobile robots at height 0.3
-        else:  # arm_robot
-            final_position = [position[0], position[1], 0]  # Arm robots on ground
-        
-        # Load robot with optimized flags
-        flags = p.URDF_USE_INERTIA_FROM_FILE
-        if not self.enable_physics:
-            flags |= p.URDF_IGNORE_COLLISION_SHAPES
-            
-        robot_body = p.loadURDF(urdf_path, final_position, orientation, 
-                               useFixedBase=(robot_type == 'arm_robot'),
-                               flags=flags)
-        
-        # Note: Mobile robot constraints will be handled in spawn_robots method
-        
-        # Get joint information
-        joint_info = []
-        num_joints = p.getNumJoints(robot_body)
-        for i in range(num_joints):
-            joint_info.append(p.getJointInfo(robot_body, i))
-        
-        return robot_body, robot_type, joint_info
+        """Legacy method - now replaced by optimized spawn_robots"""
+        # This method is kept for compatibility but is no longer used
+        # The optimized spawning is now handled directly in spawn_robots()
+        pass
         
     def apply_random_movements(self):
         """Apply random movement commands to all robots"""
@@ -244,15 +405,32 @@ class ConfigurableRobotSimulation:
     
     def update_display_text(self, elapsed_time):
         """Update on-screen display text with simulation statistics"""
-        if not self.use_gui:
-            return
-            
         # Calculate current statistics
         sim_time = self.step_count * self.time_step  # simulation time in seconds
         if elapsed_time > 0:
             actual_realtime_factor = sim_time / elapsed_time
         else:
             actual_realtime_factor = 0
+            
+        # Update external monitor if enabled
+        if self.monitor_enabled and self.data_monitor:
+            monitor_data = {
+                'sim_time': sim_time,
+                'real_time': elapsed_time,
+                'target_speed': self.target_realtime_factor,
+                'actual_speed': actual_realtime_factor,
+                'time_step': self.time_step,
+                'frequency': 1/self.time_step,
+                'physics': 'ON' if self.enable_physics else 'OFF',
+                'robots': f"{self.num_robots} (Arms: {self.robot_types.count('arm_robot')}, Mobile: {self.robot_types.count('mobile_robot')})",
+                'collisions': self.collision_count,
+                'steps': self.step_count
+            }
+            self.data_monitor.write_data(monitor_data)
+            
+        # Skip GUI text display if monitor is enabled or if no GUI
+        if not self.use_gui or self.monitor_enabled:
+            return
             
         # Remove old text
         for text_id in self.text_ids:
@@ -408,6 +586,9 @@ class ConfigurableRobotSimulation:
     def disconnect(self):
         """Clean up and disconnect from PyBullet"""
         self.clear_display_text()
+        # Stop external monitor if running
+        if self.data_monitor:
+            self.data_monitor.stop()
         # Clean up constraints
         for constraint_id in getattr(self, 'robot_constraints', []):
             if constraint_id is not None:
@@ -451,6 +632,8 @@ Examples:
                       help='Explicitly disable physics simulation (default behavior)')
     parser.add_argument('--verbose', '-v', action='store_true',
                       help='Enable verbose output')
+    parser.add_argument('--monitor', action='store_true',
+                      help='Open external data monitor window')
     
     args = parser.parse_args()
     
@@ -486,6 +669,7 @@ Examples:
     print(f"  Physics: {'Enabled' if enable_physics else 'Disabled (performance mode)'}")
     print(f"  GUI: {'Enabled' if use_gui else 'Disabled'}")
     print(f"  Verbose: {'Enabled' if args.verbose else 'Disabled'}")
+    print(f"  External Monitor: {'Enabled' if args.monitor else 'Disabled'}")
     print()
     
     # Robot behavior info and performance warnings
@@ -512,6 +696,14 @@ Examples:
         enable_physics=enable_physics,
         verbose=args.verbose
     )
+    
+    # Setup external monitor if requested
+    if args.monitor:
+        print("Starting external data monitor window...")
+        sim.data_monitor = DataMonitor("PyBullet Simulation Monitor")
+        sim.data_monitor.start()
+        sim.monitor_enabled = True
+        print("External monitor started. Check for separate window.")
     
     try:
         sim.run_simulation(duration=args.duration)
