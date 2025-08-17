@@ -34,11 +34,11 @@ class ConfigurableRobotSimulation:
         
         # Advanced URDF caching for maximum performance
         self.cached_urdfs = {}  # Cache URDF paths and flags
-        self.cached_joint_info = {}  # Cache joint information
+        self.cached_joint_info = {}  # Cache joint information (ACTIVELY USED)
         self.cached_urdf_contents = {}  # Cache URDF file contents in memory
         self.template_robots = {}  # Cache fully constructed robot templates
-        self.cached_visual_shapes = {}  # Cache visual shape IDs
-        self.cached_collision_shapes = {}  # Cache collision shape IDs
+        self.cached_visual_shapes = {}  # Cache visual shape IDs (NOT CURRENTLY USED)
+        self.cached_collision_shapes = {}  # Cache collision shape IDs (NOT CURRENTLY USED)
         self.assets_cached = False
         self.step_count = 0
         self.start_time = None
@@ -51,8 +51,10 @@ class ConfigurableRobotSimulation:
         
         # Data monitor setup
         self.data_monitor = None
+        self.console_monitor_enabled = False
         self.data_file = "/tmp/pybullet_sim_data.json"
         self.monitor_enabled = False
+        self.last_console_print = 0
         
         # Initialize PyBullet
         if use_gui:
@@ -150,9 +152,9 @@ class ConfigurableRobotSimulation:
             collision_data = p.getCollisionShapeData(template_robot, -1)  # Base link
             
             # Store all cached data
-            self.cached_joint_info[robot_type] = joint_info
-            self.cached_visual_shapes[robot_type] = visual_data
-            self.cached_collision_shapes[robot_type] = collision_data
+            self.cached_joint_info[robot_type] = joint_info  # Used for robot creation
+            self.cached_visual_shapes[robot_type] = visual_data  # Stored but not used
+            self.cached_collision_shapes[robot_type] = collision_data  # Stored but not used
             
             # Cache URDF loading parameters
             self.cached_urdfs[robot_type] = {
@@ -357,7 +359,7 @@ class ConfigurableRobotSimulation:
             actual_realtime_factor = 0
             
         # Update external monitor if enabled
-        if self.monitor_enabled and self.data_monitor:
+        if self.monitor_enabled:
             monitor_data = {
                 'sim_time': sim_time,
                 'real_time': elapsed_time,
@@ -365,61 +367,25 @@ class ConfigurableRobotSimulation:
                 'actual_speed': actual_realtime_factor,
                 'time_step': self.time_step,
                 'frequency': 1/self.time_step,
-                'physics': 'ON' if self.enable_physics else 'OFF',
-                'robots': f"{self.num_robots} (Arms: {self.robot_types.count('arm_robot')}, Mobile: {self.robot_types.count('mobile_robot')})",
+                'physics': 'enabled' if self.enable_physics else 'disabled',
+                'robots': {'total': self.num_robots, 'arms': self.robot_types.count('arm_robot'), 'mobile': self.robot_types.count('mobile_robot')},
                 'collisions': self.collision_count,
                 'steps': self.step_count
             }
-            self.data_monitor.write_data(monitor_data)
             
-        # Skip GUI text display if monitor is enabled or if no GUI
-        if not self.use_gui or self.monitor_enabled:
-            return
-            
-        # Remove old text
-        for text_id in self.text_ids:
-            try:
-                p.removeUserDebugItem(text_id)
-            except:
-                pass
-        self.text_ids.clear()
-        
-        # Display information
-        lines = [
-            f"Simulation Time: {sim_time:.1f}s",
-            f"Real Time: {elapsed_time:.1f}s",
-            f"Target Speed: {self.target_realtime_factor:.1f}x",
-            f"Actual Speed: {actual_realtime_factor:.1f}x",
-            f"Time Step: {self.time_step:.4f}s ({1/self.time_step:.0f}Hz)",
-            f"Physics: {'ON' if self.enable_physics else 'OFF'}",
-            f"Robots: {self.num_robots} (Arms: {self.robot_types.count('arm_robot')}, Mobile: {self.robot_types.count('mobile_robot')})",
-            f"Collisions: {self.collision_count}",
-            f"Step: {self.step_count}"
-        ]
-        
-        # Add text to display
-        for i, line in enumerate(lines):
-            text_id = p.addUserDebugText(
-                text=line,
-                textPosition=[0, 0, 8 + i * 0.5],  # Position in world coordinates
-                textColorRGB=[1, 1, 1],  # White text
-                textSize=1.5,
-                parentObjectUniqueId=-1,
-                parentLinkIndex=-1
-            )
-            self.text_ids.append(text_id)
+            # Write to appropriate monitor
+            if self.console_monitor_enabled:
+                # Simple console print monitor (1 second interval)
+                current_time = time.time()
+                if current_time - self.last_console_print >= 1.0:
+                    print(json.dumps(monitor_data, indent=4, ensure_ascii=False))
+                    self.last_console_print = current_time
+            elif self.data_monitor:
+                # Convert robots data format for file-based monitor compatibility
+                monitor_data['robots'] = f"{self.num_robots} (Arms: {self.robot_types.count('arm_robot')}, Mobile: {self.robot_types.count('mobile_robot')})"
+                monitor_data['physics'] = 'ON' if self.enable_physics else 'OFF'
+                self.data_monitor.write_data(monitor_data)
     
-    def clear_display_text(self):
-        """Clear all on-screen text"""
-        if not self.use_gui:
-            return
-            
-        for text_id in self.text_ids:
-            try:
-                p.removeUserDebugItem(text_id)
-            except:
-                pass
-        self.text_ids.clear()
     
     def print_statistics(self, elapsed_time):
         """Print simulation statistics"""
@@ -454,7 +420,6 @@ class ConfigurableRobotSimulation:
             while True:
                 current_time = time.time()
                 elapsed_time = current_time - self.start_time
-                
                 # Check if duration exceeded
                 if elapsed_time >= duration:
                     break
@@ -478,9 +443,13 @@ class ConfigurableRobotSimulation:
                             print(f"Time {elapsed_time:.1f}s: {len(collisions)} collision pairs detected")
                     self.last_collision_check = current_time
                 
-                # Update display text every 0.1 seconds for smooth updates
-                if self.use_gui and current_time - self.last_display_update >= 0.1:
-                    self.update_display_text(elapsed_time)
+                # Dynamic display update interval based on timestep for smooth GUI
+                # Higher frequency timesteps need less frequent GUI updates
+                display_interval = max(0.1, min(1.0, self.time_step * 50))  # 0.1-1.0 seconds
+                if current_time - self.last_display_update >= display_interval:
+                    # Only call update_display_text if GUI is enabled and monitor is disabled
+                    if self.use_gui and self.monitor_enabled:
+                        self.update_display_text(elapsed_time)
                     self.last_display_update = current_time
                 
                 # Only step simulation if we're behind the target
@@ -577,7 +546,9 @@ Examples:
     parser.add_argument('--verbose', '-v', action='store_true',
                       help='Enable verbose output')
     parser.add_argument('--monitor', action='store_true',
-                      help='Open external data monitor window')
+                      help='Enable data monitor (file-based by default)')
+    parser.add_argument('--console-monitor', action='store_true',
+                      help='Use console-based monitor (no GUI, text only)')
     
     args = parser.parse_args()
     
@@ -643,11 +614,19 @@ Examples:
     
     # Setup external monitor if requested
     if args.monitor:
-        print("Starting external data monitor window...")
-        sim.data_monitor = DataMonitor("PyBullet Simulation Monitor")
-        sim.data_monitor.start()
-        sim.monitor_enabled = True
-        print("External monitor started. Check for separate window.")
+        if args.console_monitor:
+            # Use simple console print monitor
+            print("Starting console data monitor...")
+            sim.console_monitor_enabled = True
+            sim.monitor_enabled = True
+            print("Console monitor started.")
+        else:
+            # Use file-based monitor (default)
+            print("Starting file-based data monitor window...")
+            sim.data_monitor = DataMonitor("PyBullet Simulation Monitor")
+            sim.data_monitor.start()
+            sim.monitor_enabled = True
+            print("External monitor started. Check for separate window.")
     
     try:
         sim.run_simulation(duration=args.duration)
