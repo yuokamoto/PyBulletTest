@@ -19,3 +19,6 @@
 - 100台のロボットがランダムに動くexampleの作成
 
 
+todo
+- collision check
+- 

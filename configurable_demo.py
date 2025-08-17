@@ -101,12 +101,6 @@ class ConfigurableRobotSimulation:
         # Pre-cache robot assets for faster spawning
         self.cache_robot_assets()
         
-    
-    def _hsv_to_rgb(self, h, s, v):
-        """Convert HSV to RGB color space"""
-        import colorsys
-        return list(colorsys.hsv_to_rgb(h, s, v))
-        
     def cache_robot_assets(self):
         """Pre-load and cache all robot assets including URDF contents and templates"""
         if self.assets_cached:
